@@ -65,6 +65,8 @@ check_min_version("0.10.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
+def print_tensor_device(tensor_name, tensor):
+    print(f"{tensor_name} is on device: {tensor.device}")
 
 class Net(nn.Module):
     """
@@ -751,6 +753,7 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                     print("indices", indices)
                     print("sigmas", sigmas[:,0,0,0,0])
                 noisy_latents = latents + noise * sigmas
+                print_tensor_device("noisy_latents", noisy_latents)
 
                 inp_noisy_latents_scale = noisy_latents * c_in
 
@@ -758,10 +761,13 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                 # Concatenate the `conditional_latents` with the `noisy_latents`.
                 conditional_latents = conditional_latents.unsqueeze(
                     1).repeat(1, noisy_latents.shape[1], 1, 1, 1)
+                print_tensor_device("conditional_latents", conditional_latents)
                 inp_noisy_latents = torch.cat(
                     [inp_noisy_latents_scale, conditional_latents], dim=2)
+                print_tensor_device("inp_noisy_latents", inp_noisy_latents)
                 inp_noisy_latents_uncond = torch.cat(
                     [inp_noisy_latents_scale, torch.zeros_like(conditional_latents)], dim=2)
+                print_tensor_device("inp_noisy_latents_uncond", inp_noisy_latents_uncond)
                 # encoder_hidden_states_uncond = torch.zeros_like(encoder_hidden_states)
 
                 with torch.no_grad():
