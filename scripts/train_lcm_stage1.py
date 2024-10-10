@@ -792,6 +792,8 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                         uncond_fwd,
                     )
 
+                    num_frames = teacher_pred_cond.shape[1]
+                    print("num_frames of teacher_pred_cond", num_frames)
                     guidance_scale = torch.linspace(np.random.choice([1, 1.25, 1.5]), np.random.choice([2, 2.25, 2.5]), cfg.num_frames).unsqueeze(0)
                     guidance_scale = guidance_scale.to(accelerator.device, weight_dtype)
                     guidance_scale = append_dims(guidance_scale, teacher_pred_cond.ndim)
