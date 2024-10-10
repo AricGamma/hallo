@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import random
+import traceback
 import warnings
 from datetime import datetime
 
@@ -753,11 +754,7 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                 if accelerator.is_main_process:
                     print("indices", indices)
                     print("sigmas", sigmas[:,0,0,0,0])
-                print_tensor_device("latents", latents)
-                print_tensor_device("noise", noise)
-                print_tensor_device("sigmas", sigmas)
                 noisy_latents = latents + noise * sigmas
-                print_tensor_device("noisy_latents", noisy_latents)
 
                 inp_noisy_latents_scale = noisy_latents * c_in
 
@@ -1013,3 +1010,4 @@ if __name__ == "__main__":
         train_stage1_process(config)
     except Exception as e:
         logging.error("Failed to execute the training process: %s", e)
+        logging.error(traceback.format_exc())
