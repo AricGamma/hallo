@@ -752,6 +752,9 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                 if accelerator.is_main_process:
                     print("indices", indices)
                     print("sigmas", sigmas[:,0,0,0,0])
+                print_tensor_device("latents", latents)
+                print_tensor_device("noise", noise)
+                print_tensor_device("sigmas", sigmas)
                 noisy_latents = latents + noise * sigmas
                 print_tensor_device("noisy_latents", noisy_latents)
 
