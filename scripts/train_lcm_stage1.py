@@ -780,7 +780,7 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                         uncond_fwd,
                     )
 
-                    guidance_scale = torch.linspace(np.random.choice([1, 1.25, 1.5]), np.random.choice([2, 2.25, 2.5]), args.num_frames).unsqueeze(0)
+                    guidance_scale = torch.linspace(np.random.choice([1, 1.25, 1.5]), np.random.choice([2, 2.25, 2.5]), cfg.num_frames).unsqueeze(0)
                     guidance_scale = guidance_scale.to(accelerator.device, weight_dtype)
                     guidance_scale = append_dims(guidance_scale, teacher_pred_cond.ndim)
                     teacher_output = teacher_pred_uncond + guidance_scale * (teacher_pred_cond - teacher_pred_uncond)

@@ -1,5 +1,6 @@
 N: 40
 per_gpu_batch_size: 1
+num_frames: 25
 data:
   train_bs: 8
   train_width: 512
