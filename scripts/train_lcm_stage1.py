@@ -743,18 +743,18 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                 cond_sigmas = rand_log_normal(shape=[bsz,], loc=-3.0, scale=0.5).to(latents)
                 # cond_sigmas[:] = 0
                 noise_aug_strength = cond_sigmas[0] # TODO: support batch > 1
-                cond_sigmas = cond_sigmas[:, None, None, None, None]
+                cond_sigmas = cond_sigmas[:, None, None, None, None, None, None, None, None]
                 # conditional_pixel_values = ref_img
                 conditional_pixel_values = ref_img.unsqueeze(1)
                 conditional_pixel_values = \
                     torch.randn_like(conditional_pixel_values) * cond_sigmas + conditional_pixel_values
-                conditional_latents = tensor_to_vae_latent(conditional_pixel_values, vae)[:, 0, :, :, :]
+                conditional_latents = tensor_to_vae_latent(conditional_pixel_values, vae)[:, 0, :, :, :, :, :, :, :]
                 conditional_latents = conditional_latents / vae.config.scaling_factor
 
                 indices, sigmas, timesteps, weights, c_in, c_out, c_skip = svd_solver.sample_timesteps(cfg.per_gpu_batch_size)
                 if accelerator.is_main_process:
                     print("indices", indices)
-                    print("sigmas", sigmas[:,0,0,0,0])
+                    print("sigmas", sigmas[:,0,0,0,0,0,0,0,0])
                 noisy_latents = latents + noise * sigmas
 
                 inp_noisy_latents_scale = noisy_latents * c_in
@@ -762,7 +762,7 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                 
                 # Concatenate the `conditional_latents` with the `noisy_latents`.
                 conditional_latents = conditional_latents.unsqueeze(
-                    1).repeat(1, noisy_latents.shape[1], 1, 1, 1)
+                    1).repeat(1, noisy_latents.shape[1], 1, 1, 1, 1, 1, 1, 1)
                 inp_noisy_latents = torch.cat(
                     [inp_noisy_latents_scale, conditional_latents], dim=2)
                 inp_noisy_latents_uncond = torch.cat(
