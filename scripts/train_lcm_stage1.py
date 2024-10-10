@@ -806,6 +806,11 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
 
                     model_pred_next = target_net(inp_noisy_latents_next, timesteps_next, ref_image_latents, face_emb, face_mask_img, uncond_fwd)
 
+                    print("model_pred_next ", model_pred_next.shape)
+                    print("c_out_next ", c_out_next.shape)
+
+                    print("noisy_latents_next ", noisy_latents_next.shape)
+                    print("c_skip_next ", c_skip_next.shape)
                     denoised_latents_next = model_pred_next * c_out_next + noisy_latents_next * c_skip_next
 
                 # # Sample a random timestep for each video
