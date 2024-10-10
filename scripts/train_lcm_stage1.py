@@ -166,6 +166,10 @@ def get_noise_scheduler(cfg: argparse.Namespace):
         train noise scheduler and val noise scheduler
     """
     sched_kwargs = OmegaConf.to_container(cfg.noise_scheduler_kwargs)
+
+    sched_kwargs.pop('sigma_min', None)
+    sched_kwargs.pop('sigma_max', None)
+
     if cfg.enable_zero_snr:
         sched_kwargs.update(
             rescale_betas_zero_snr=True,
@@ -541,7 +545,7 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
     # get noise scheduler
     train_noise_scheduler, val_noise_scheduler = get_noise_scheduler(cfg)
 
-    svd_solver = SVDSolver(cfg.N, train_noise_scheduler.config.sigma_min, train_noise_scheduler.config.sigma_max, 7,0.7, 1.6)
+    svd_solver = SVDSolver(cfg.N, cfg.noise_scheduler_kwargs.sigma_min, cfg.noise_scheduler_kwargs.sigma_max, 7,0.7, 1.6)
 
     # init optimizer
     if cfg.solver.enable_xformers_memory_efficient_attention:
