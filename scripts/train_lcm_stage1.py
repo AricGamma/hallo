@@ -548,7 +548,7 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
     train_noise_scheduler, val_noise_scheduler = get_noise_scheduler(cfg)
 
     svd_solver = SVDSolver(cfg.N, cfg.noise_scheduler_kwargs.sigma_min, cfg.noise_scheduler_kwargs.sigma_max, 7,0.7, 1.6)
-    svd_solver.to(accelerator.devuce, weight_dtype)
+    svd_solver.to(accelerator.device, weight_dtype)
 
     # init optimizer
     if cfg.solver.enable_xformers_memory_efficient_attention:
