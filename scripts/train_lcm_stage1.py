@@ -748,8 +748,7 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                 # cond_sigmas[:] = 0
                 noise_aug_strength = cond_sigmas[0] # TODO: support batch > 1
                 cond_sigmas = cond_sigmas[:, None, None, None, None]
-                # conditional_pixel_values = ref_img
-                conditional_pixel_values = ref_img.unsqueeze(1)
+                torch.cat([ref_image_latents, face_emb], dim=2)
                 conditional_pixel_values = \
                     torch.randn_like(conditional_pixel_values) * cond_sigmas + conditional_pixel_values
                 conditional_latents = tensor_to_vae_latent(conditional_pixel_values, vae)[:, 0, :, :, :]
