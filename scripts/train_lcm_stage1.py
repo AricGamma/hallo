@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import random
+import traceback
 import warnings
 from datetime import datetime
 
@@ -65,6 +66,8 @@ check_min_version("0.10.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
+def print_tensor_device(tensor_name, tensor):
+    print(f"{tensor_name} is on device: {tensor.device}")
 
 class Net(nn.Module):
     """
@@ -166,6 +169,10 @@ def get_noise_scheduler(cfg: argparse.Namespace):
         train noise scheduler and val noise scheduler
     """
     sched_kwargs = OmegaConf.to_container(cfg.noise_scheduler_kwargs)
+
+    sched_kwargs.pop('sigma_min', None)
+    sched_kwargs.pop('sigma_max', None)
+
     if cfg.enable_zero_snr:
         sched_kwargs.update(
             rescale_betas_zero_snr=True,
@@ -553,7 +560,8 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
     # get noise scheduler
     train_noise_scheduler, val_noise_scheduler = get_noise_scheduler(cfg)
 
-    svd_solver = SVDSolver(cfg.N, train_noise_scheduler.config.sigma_min, train_noise_scheduler.config.sigma_max, 7,0.7, 1.6)
+    svd_solver = SVDSolver(cfg.N, cfg.noise_scheduler_kwargs.sigma_min, cfg.noise_scheduler_kwargs.sigma_max, 7,0.7, 1.6)
+    svd_solver.to(accelerator.device, weight_dtype)
 
     # init optimizer
     if cfg.solver.enable_xformers_memory_efficient_attention:
@@ -744,10 +752,15 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                         dtype=imageproj.dtype, device=imageproj.device
                     )
                 
+                print("face_emb", face_emb.shape)
+                print("ref_image_latents", ref_image_latents.shape)
+                print("face_mask_img", face_mask_img.shape)
+
                 cond_sigmas = rand_log_normal(shape=[bsz,], loc=-3.0, scale=0.5).to(latents)
                 # cond_sigmas[:] = 0
                 noise_aug_strength = cond_sigmas[0] # TODO: support batch > 1
                 cond_sigmas = cond_sigmas[:, None, None, None, None]
+                torch.cat([ref_image_latents, face_emb], dim=2)
                 conditional_pixel_values = \
                     torch.randn_like(conditional_pixel_values) * cond_sigmas + conditional_pixel_values
                 conditional_latents = tensor_to_vae_latent(conditional_pixel_values, vae)[:, 0, :, :, :]
@@ -792,7 +805,9 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                         uncond_fwd,
                     )
 
-                    guidance_scale = torch.linspace(np.random.choice([1, 1.25, 1.5]), np.random.choice([2, 2.25, 2.5]), args.num_frames).unsqueeze(0)
+                    num_frames = teacher_pred_cond.shape[1]
+                    print("num_frames of teacher_pred_cond", num_frames)
+                    guidance_scale = torch.linspace(np.random.choice([1, 1.25, 1.5]), np.random.choice([2, 2.25, 2.5]), cfg.num_frames).unsqueeze(0)
                     guidance_scale = guidance_scale.to(accelerator.device, weight_dtype)
                     guidance_scale = append_dims(guidance_scale, teacher_pred_cond.ndim)
                     teacher_output = teacher_pred_uncond + guidance_scale * (teacher_pred_cond - teacher_pred_uncond)
@@ -806,6 +821,11 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
 
                     model_pred_next = target_net(inp_noisy_latents_next, timesteps_next, ref_image_latents, face_emb, face_mask_img, uncond_fwd)
 
+                    print("model_pred_next ", model_pred_next.shape)
+                    print("c_out_next ", c_out_next.shape)
+
+                    print("noisy_latents_next ", noisy_latents_next.shape)
+                    print("c_skip_next ", c_skip_next.shape)
                     denoised_latents_next = model_pred_next * c_out_next + noisy_latents_next * c_skip_next
 
                 # # Sample a random timestep for each video
@@ -1011,3 +1031,4 @@ if __name__ == "__main__":
         train_stage1_process(config)
     except Exception as e:
         logging.error("Failed to execute the training process: %s", e)
+        logging.error(traceback.format_exc())

@@ -1,6 +1,7 @@
 N: 40
 per_gpu_batch_size: 1
 target_ema_decay: 0.95
+num_frames: 4
 data:
   train_bs: 8
   train_width: 512
