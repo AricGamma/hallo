@@ -456,6 +456,18 @@ def append_dims(x, target_dims):
         raise ValueError(f"input has {x.ndim} dims but target_dims is {target_dims}, which is less")
     return x[(...,) + (None,) * dims_to_append]
 
+@torch.no_grad()
+def update_ema(target_params, source_params, rate=0.99):
+    """
+    Update target parameters to be closer to those of source parameters using
+    an exponential moving average.
+
+    :param target_params: the target parameter sequence.
+    :param source_params: the source parameter sequence.
+    :param rate: the EMA rate (closer to 1 means slower).
+    """
+    for targ, src in zip(target_params, source_params):
+        targ.detach().mul_(rate).add_(src, alpha=1 - rate)
 
 def train_stage1_process(cfg: argparse.Namespace) -> None:
     """
@@ -878,10 +890,11 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        trainable_params,
-                        cfg.solver.max_grad_norm,
-                    )
+                    # accelerator.clip_grad_norm_(
+                    #     trainable_params,
+                    #     cfg.solver.max_grad_norm,
+                    # )
+                    update_ema(target_net.parameters(), net.parameters(), cfg.target_ema_decay)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
