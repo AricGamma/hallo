@@ -21,13 +21,11 @@ import logging
 import math
 import os
 import random
-import traceback
 import warnings
 from datetime import datetime
 
 import cv2
 import diffusers
-from einops import rearrange
 import mlflow
 import numpy as np
 import torch
@@ -66,8 +64,6 @@ check_min_version("0.10.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
-def print_tensor_device(tensor_name, tensor):
-    print(f"{tensor_name} is on device: {tensor.device}")
 
 class Net(nn.Module):
     """
@@ -169,10 +165,6 @@ def get_noise_scheduler(cfg: argparse.Namespace):
         train noise scheduler and val noise scheduler
     """
     sched_kwargs = OmegaConf.to_container(cfg.noise_scheduler_kwargs)
-
-    sched_kwargs.pop('sigma_min', None)
-    sched_kwargs.pop('sigma_max', None)
-
     if cfg.enable_zero_snr:
         sched_kwargs.update(
             rescale_betas_zero_snr=True,
@@ -198,6 +190,7 @@ def log_validation(
     save_dir,
     global_step,
     face_analysis_model_path,
+    name,
 ):
     """
     Log validation generation image.
@@ -283,7 +276,7 @@ def log_validation(
         canvas.paste(res_image_pil, (w * 2, 0))
 
         out_file = os.path.join(
-            save_dir, f"{global_step:06d}-{ref_name}_{mask_name}.jpg"
+            save_dir, name, f"{global_step:06d}-{ref_name}_{mask_name}.jpg"
         )
         canvas.save(out_file)
 
@@ -293,8 +286,20 @@ def log_validation(
 
     return pil_images
 
-def build_model(cfg: argparse.Namespace, weight_dtype, type: str="teacher") -> Net:
-    
+# From LCMScheduler.get_scalings_for_boundary_condition_discrete
+def scalings_for_boundary_conditions(timestep, sigma_data=0.5, timestep_scaling=10.0):
+    c_skip = sigma_data**2 / ((timestep / 0.1) ** 2 + sigma_data**2)
+    c_out = (timestep / 0.1) / ((timestep / 0.1) ** 2 + sigma_data**2) ** 0.5
+    return c_skip, c_out
+
+def append_dims(x, target_dims):
+    """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
+    dims_to_append = target_dims - x.ndim
+    if dims_to_append < 0:
+        raise ValueError(f"input has {x.ndim} dims but target_dims is {target_dims}, which is less")
+    return x[(...,) + (None,) * dims_to_append]
+
+def build_net(cfg: argparse.Namespace, weight_dtype: torch.dtype) -> Net:
     reference_unet = UNet2DConditionModel.from_pretrained(
         cfg.base_model_path,
         subfolder="unet",
@@ -327,19 +332,6 @@ def build_model(cfg: argparse.Namespace, weight_dtype, type: str="teacher") -> N
             conditioning_embedding_channels=320,
         ).to(device="cuda", dtype=weight_dtype)
 
-    if type == "teacher":
-        # Freeze
-        denoising_unet.requires_grad_(False)
-        reference_unet.requires_grad_(False)
-        imageproj.requires_grad_(False)
-        face_locator.requires_grad_(False)
-    else:
-        # Unfreeze
-        denoising_unet.requires_grad_(True)
-        reference_unet.requires_grad_(False)
-        imageproj.requires_grad_(False)
-        face_locator.requires_grad_(False)
-
     reference_control_writer = ReferenceAttentionControl(
         reference_unet,
         do_classifier_free_guidance=False,
@@ -353,6 +345,11 @@ def build_model(cfg: argparse.Namespace, weight_dtype, type: str="teacher") -> N
         fusion_blocks="full",
     )
 
+    denoising_unet.requires_grad_(False)
+    reference_unet.requires_grad_(False)
+    imageproj.requires_grad_(False)
+    face_locator.requires_grad_(False)
+
     net = Net(
         reference_unet,
         denoising_unet,
@@ -364,104 +361,80 @@ def build_model(cfg: argparse.Namespace, weight_dtype, type: str="teacher") -> N
 
     return net
 
-class SVDSolver():
-    def __init__(self, N, sigma_min, sigma_max, rho, Pmean, Pstd):
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.rho = rho
-        self.N = N
-        self.Pmean = Pmean
-        self.Pstd = Pstd
+def extract_into_tensor(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
+# Compare LCMScheduler.step, Step 4
+def predicted_origin(model_output, timesteps, sample, prediction_type, alphas, sigmas):
+    if prediction_type == "epsilon":
+        sigmas = extract_into_tensor(sigmas, timesteps, sample.shape)
+        alphas = extract_into_tensor(alphas, timesteps, sample.shape)
+        pred_x_0 = (sample - sigmas * model_output) / alphas
+    elif prediction_type == "v_prediction":
+        sigmas = extract_into_tensor(sigmas, timesteps, sample.shape)
+        alphas = extract_into_tensor(alphas, timesteps, sample.shape)
+        pred_x_0 = alphas * sample - sigmas * model_output
+    else:
+        raise ValueError(f"Prediction type {prediction_type} currently not supported.")
 
-        self.indices = torch.arange(0, N, dtype=torch.float)
-        self.sigmas = (sigma_max ** (1 / rho) + self.indices / (N - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho)))**rho
-        
-        self.indices = torch.cat([self.indices, torch.tensor([N])])
-        self.sigmas  = torch.cat([self.sigmas, torch.tensor([0])])
+    return pred_x_0
 
+class DDIMSolver:
+    def __init__(self, alpha_cumprods, timesteps=1000, ddim_timesteps=50):
+        # DDIM sampling parameters
+        step_ratio = timesteps // ddim_timesteps
+        self.ddim_timesteps = (np.arange(1, ddim_timesteps + 1) * step_ratio).round().astype(np.int64) - 1
+        self.ddim_alpha_cumprods = alpha_cumprods[self.ddim_timesteps]
+        self.ddim_alpha_cumprods_prev = np.asarray(
+            [alpha_cumprods[0]] + alpha_cumprods[self.ddim_timesteps[:-1]].tolist()
+        )
+        # convert to torch tensors
+        self.ddim_timesteps = torch.from_numpy(self.ddim_timesteps).long()
+        self.ddim_alpha_cumprods = torch.from_numpy(self.ddim_alpha_cumprods)
+        self.ddim_alpha_cumprods_prev = torch.from_numpy(self.ddim_alpha_cumprods_prev)
 
-        self.probs = torch.ones_like(self.sigmas[:-1])*(1/N)
+    def to(self, device):
+        self.ddim_timesteps = self.ddim_timesteps.to(device)
+        self.ddim_alpha_cumprods = self.ddim_alpha_cumprods.to(device)
+        self.ddim_alpha_cumprods_prev = self.ddim_alpha_cumprods_prev.to(device)
+        return self
 
-        self.sigmas = self.sigmas[:,None,None,None,None]
-        self.timesteps = torch.Tensor([0.25 * (sigma + 1e-44).log() for sigma in self.sigmas])
+    def ddim_step(self, pred_x0, pred_noise, timestep_index):
+        alpha_cumprod_prev = extract_into_tensor(self.ddim_alpha_cumprods_prev, timestep_index, pred_x0.shape)
+        dir_xt = (1.0 - alpha_cumprod_prev).sqrt() * pred_noise
+        x_prev = alpha_cumprod_prev.sqrt() * pred_x0 + dir_xt
+        return x_prev
 
-        self.weights = (1/(self.sigmas[:-1] - self.sigmas[1:]))**0.1 # This is not optimal and can influence the training dynamics a lot. Wish someone can make it better.
-        self.c_out = -self.sigmas / ((self.sigmas**2 + 1)**0.5)
-        self.c_skip = 1 / (self.sigmas**2 + 1)
-        self.c_in = 1 /((self.sigmas**2 + 1) ** 0.5)
+# From LatentConsistencyModel.get_guidance_scale_embedding
+def guidance_scale_embedding(w, embedding_dim=512, dtype=torch.float32):
+    """
+    See https://github.com/google-research/vdm/blob/dc27b98a554f65cdc654b800da5aa1846545d41b/model_vdm.py#L298
 
-    def sample_params(self, indices):
+    Args:
+        timesteps (`torch.Tensor`):
+            generate embedding vectors at these timesteps
+        embedding_dim (`int`, *optional*, defaults to 512):
+            dimension of the embeddings to generate
+        dtype:
+            data type of the generated embeddings
 
-        sampled_sigmas = self.sigmas[indices]
-        sampled_timesteps = self.timesteps[indices]
-        sampled_weights = self.weights[torch.where(indices>self.weights.shape[0]-1,self.weights.shape[0]-1,indices)]
-        sampled_c_out = self.c_out[indices]
-        sampled_c_in = self.c_in[indices]
-        sampled_c_skip = self.c_skip[indices]
+    Returns:
+        `torch.FloatTensor`: Embedding vectors with shape `(len(timesteps), embedding_dim)`
+    """
+    assert len(w.shape) == 1
+    w = w * 1000.0
 
-        return indices, sampled_sigmas, sampled_timesteps, sampled_weights, sampled_c_in, sampled_c_out, sampled_c_skip
-
-
-    def sample_timesteps(self, bsz):
-        
-        sampled_indices = torch.multinomial(self.probs, bsz, replacement=True)
-
-        sampled_indices, sampled_sigmas, sampled_timesteps, sampled_weights, sampled_c_in, sampled_c_out, sampled_c_skip = self.sample_params(sampled_indices)
-
-        return sampled_indices, sampled_sigmas, sampled_timesteps, sampled_weights, sampled_c_in, sampled_c_out, sampled_c_skip
-
-
-    def predicted_origin(self, model_output, indices, sample):
-        return model_output * self.c_out[indices] + sample * self.c_skip[indices]
-
-    @torch.no_grad()
-    def euler_solver(self, model_output, sample, indices, indices_next):
-        x = sample
-        denoiser = self.predicted_origin(model_output, indices, sample)
-        d = (x - denoiser) / self.sigmas[indices]
-        sample = x + d * (self.sigmas[indices_next] - self.sigmas[indices])
-        
-        return sample
-
-    @torch.no_grad()
-    def heun_solver(self, model_output, sample, indices, indices_next, model_fn):
-        pass
-
-    def to(self,device,dtype):
-        self.indinces = self.indices.to(device,dtype)
-        self.sigmas = self.sigmas.to(device,dtype)
-        self.timesteps=self.timesteps.to(device,dtype)
-        self.probs=self.probs.to(device,dtype)
-        self.weights=self.weights.to(device,dtype)
-        self.c_out=self.c_out.to(device,dtype)
-        self.c_skip=self.c_skip.to(device,dtype)
-        self.c_in=self.c_in.to(device,dtype)
-
-def rand_log_normal(shape, loc=0., scale=1., device='cpu', dtype=torch.float32):
-    """Draws samples from an lognormal distribution."""
-    u = torch.rand(shape, dtype=dtype, device=device) * (1 - 2e-7) + 1e-7
-    return torch.distributions.Normal(loc, scale).icdf(u).exp()
-
-    # whats the difference between torch.randn(loc, scale).exp
-
-def tensor_to_vae_latent(t, vae):
-    video_length = t.shape[1]
-
-    t = rearrange(t, "b f c h w -> (b f) c h w")
-
-    latents = vae.encode(t).latent_dist.sample()
-    latents = rearrange(latents, "(b f) c h w -> b f c h w", f=video_length)
-    latents = latents * vae.config.scaling_factor
-
-    return latents
-
-def append_dims(x, target_dims):
-    """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
-    dims_to_append = target_dims - x.ndim
-    if dims_to_append < 0:
-        raise ValueError(f"input has {x.ndim} dims but target_dims is {target_dims}, which is less")
-    return x[(...,) + (None,) * dims_to_append]
+    half_dim = embedding_dim // 2
+    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=dtype) * -emb)
+    emb = w.to(dtype)[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:  # zero pad
+        emb = torch.nn.functional.pad(emb, (0, 1))
+    assert emb.shape == (w.shape[0], embedding_dim)
+    return emb
 
 @torch.no_grad()
 def update_ema(target_params, source_params, rate=0.99):
@@ -529,6 +502,7 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
 
     accelerator.wait_for_everyone()
 
+    # create model
     if cfg.weight_dtype == "fp16":
         weight_dtype = torch.float16
     elif cfg.weight_dtype == "bf16":
@@ -544,24 +518,25 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
     vae = AutoencoderKL.from_pretrained(cfg.vae_model_path).to(
         "cuda", dtype=weight_dtype
     )
+    # Freeze
     vae.requires_grad_(False)
 
-    teacher_net = build_model(cfg, weight_dtype)
-    target_net = build_model(cfg, weight_dtype)
-
-    net = build_model(cfg, weight_dtype, "student")
-
+    net = build_net(cfg, weight_dtype)
     reference_unet = net.reference_unet
     denoising_unet = net.denoising_unet
-    imageproj = net.imageproj
-    reference_control_reader = net.reference_control_reader
     reference_control_writer = net.reference_control_writer
+    reference_control_reader = net.reference_control_reader
+    imageproj = net.imageproj
+    denoising_unet.requires_grad_(True)
+    net.train()
+
+    teacher_net = build_net(cfg, weight_dtype)
+
+    target_net = build_net(cfg, weight_dtype)
+    target_net.train()
 
     # get noise scheduler
     train_noise_scheduler, val_noise_scheduler = get_noise_scheduler(cfg)
-
-    svd_solver = SVDSolver(cfg.N, cfg.noise_scheduler_kwargs.sigma_min, cfg.noise_scheduler_kwargs.sigma_max, 7,0.7, 1.6)
-    svd_solver.to(accelerator.device, weight_dtype)
 
     # init optimizer
     if cfg.solver.enable_xformers_memory_efficient_attention:
@@ -599,6 +574,20 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
+
+    # The scheduler calculates the alpha and sigma schedule for us
+    alpha_schedule = torch.sqrt(train_noise_scheduler.alphas_cumprod)
+    sigma_schedule = torch.sqrt(1 - train_noise_scheduler.alphas_cumprod)
+    solver = DDIMSolver(
+        train_noise_scheduler.alphas_cumprod.numpy(),
+        timesteps=train_noise_scheduler.config.num_train_timesteps,
+        ddim_timesteps=cfg.solver.num_ddim_timesteps,
+    )
+
+    # Also move the alpha and sigma noise schedules to accelerator.device.
+    alpha_schedule = alpha_schedule.to(accelerator.device)
+    sigma_schedule = sigma_schedule.to(accelerator.device)
+    solver = solver.to(accelerator.device)
 
     trainable_params = list(
         filter(lambda p: p.requires_grad, net.parameters()))
@@ -700,8 +689,6 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
         disable=not accelerator.is_main_process,
     )
     progress_bar.set_description("Steps")
-    teacher_net.train()
-    target_net.train()
     net.train()
     for _ in range(first_epoch, num_train_epochs):
         train_loss = 0.0
@@ -720,7 +707,22 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                         (noise.shape[0], noise.shape[1], 1, 1, 1),
                         device=noise.device,
                     )
+
                 bsz = latents.shape[0]
+                
+                # Sample a random timestep for each image t_n ~ U[0, N - k - 1] without bias.
+                topk = train_noise_scheduler.config.num_train_timesteps // cfg.solver.num_ddim_timesteps
+                index = torch.randint(0, cfg.solver.num_ddim_timesteps, (bsz,), device=latents.device).long()
+                start_timesteps = solver.ddim_timesteps[index]
+                timesteps = start_timesteps - topk
+                timesteps = torch.where(timesteps < 0, torch.zeros_like(timesteps), timesteps)
+                # timesteps = timesteps.long()
+
+                # 20.4.4. Get boundary scalings for start_timesteps and (end) timesteps.
+                c_skip_start, c_out_start = scalings_for_boundary_conditions(start_timesteps)
+                c_skip_start, c_out_start = [append_dims(x, latents.ndim) for x in [c_skip_start, c_out_start]]
+                c_skip, c_out = scalings_for_boundary_conditions(timesteps)
+                c_skip, c_out = [append_dims(x, latents.ndim) for x in [c_skip, c_out]]
 
                 face_mask_img = batch["tgt_mask"]
                 face_mask_img = face_mask_img.unsqueeze(
@@ -728,15 +730,14 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                 face_mask_img = face_mask_img.to(weight_dtype)
 
                 uncond_fwd = random.random() < cfg.uncond_ratio
-                face_emb_list = []
+                face_emb_list_cond = []
+                face_emb_list_uncond = []
                 ref_image_list = []
                 for _, (ref_img, face_emb) in enumerate(
                     zip(batch["ref_img"], batch["face_emb"])
                 ):
-                    if uncond_fwd:
-                        face_emb_list.append(torch.zeros_like(face_emb))
-                    else:
-                        face_emb_list.append(face_emb)
+                    face_emb_list_uncond.append(torch.zeros_like(face_emb))
+                    face_emb_list_cond.append(face_emb)
                     ref_image_list.append(ref_img)
 
                 with torch.no_grad():
@@ -748,178 +749,151 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                     ).latent_dist.sample()
                     ref_image_latents = ref_image_latents * 0.18215
 
-                    face_emb = torch.stack(face_emb_list, dim=0).to(
+                    face_emb_cond = torch.stack(face_emb_list_cond, dim=0).to(
                         dtype=imageproj.dtype, device=imageproj.device
                     )
-                
-                print("face_emb", face_emb.shape)
-                print("ref_image_latents", ref_image_latents.shape)
-                print("face_mask_img", face_mask_img.shape)
-
-                cond_sigmas = rand_log_normal(shape=[bsz,], loc=-3.0, scale=0.5).to(latents)
-                # cond_sigmas[:] = 0
-                noise_aug_strength = cond_sigmas[0] # TODO: support batch > 1
-                cond_sigmas = cond_sigmas[:, None, None, None, None]
-                torch.cat([ref_image_latents, face_emb], dim=2)
-                conditional_pixel_values = \
-                    torch.randn_like(conditional_pixel_values) * cond_sigmas + conditional_pixel_values
-                conditional_latents = tensor_to_vae_latent(conditional_pixel_values, vae)[:, 0, :, :, :]
-                conditional_latents = conditional_latents / vae.config.scaling_factor
-
-                indices, sigmas, timesteps, weights, c_in, c_out, c_skip = svd_solver.sample_timesteps(cfg.per_gpu_batch_size)
-                if accelerator.is_main_process:
-                    print("indices", indices)
-                    print("sigmas", sigmas[:,0,0,0,0])
-                noisy_latents = latents + noise * sigmas
-
-                inp_noisy_latents_scale = noisy_latents * c_in
-
-                
-                # Concatenate the `conditional_latents` with the `noisy_latents`.
-                conditional_latents = conditional_latents.unsqueeze(
-                    1).repeat(1, noisy_latents.shape[1], 1, 1, 1)
-                inp_noisy_latents = torch.cat(
-                    [inp_noisy_latents_scale, conditional_latents], dim=2)
-                inp_noisy_latents_uncond = torch.cat(
-                    [inp_noisy_latents_scale, torch.zeros_like(conditional_latents)], dim=2)
-                # encoder_hidden_states_uncond = torch.zeros_like(encoder_hidden_states)
-
-                with torch.no_grad():
-                    indices_next = indices + 1
-
-                    teacher_pred_cond = teacher_net(
-                        inp_noisy_latents,
-                        timesteps,
-                        ref_image_latents,
-                        face_emb,
-                        face_mask_img,
-                        uncond_fwd,
+                    face_emb_uncond = torch.stack(face_emb_list_uncond, dim=0).to(
+                        dtype=imageproj.dtype, device=imageproj.device
                     )
 
-                    teacher_pred_uncond = teacher_net(
-                        inp_noisy_latents_uncond,
-                        timesteps,
-                        ref_image_latents,
-                        face_emb,
-                        face_mask_img,
-                        uncond_fwd,
+                # add noise
+                noisy_latents = train_noise_scheduler.add_noise(
+                    latents, noise, start_timesteps
+                )
+
+                # 20.4.6. Sample a random guidance scale w from U[w_min, w_max] and embed it
+                w = (cfg.guidance_scale.w_max - cfg.guidance_scale.w_min) * torch.rand((bsz,)) + cfg.guidance_scale.w_min
+                w_embedding = guidance_scale_embedding(w, embedding_dim=cfg.unet_time_cond_proj_dim)
+                w = w.reshape(bsz, 1, 1, 1)
+                # Move to U-Net device and dtype
+                w = w.to(device=latents.device, dtype=latents.dtype)
+                w_embedding = w_embedding.to(device=latents.device, dtype=latents.dtype)
+
+                # Get the target for loss depending on the prediction type
+                if train_noise_scheduler.prediction_type == "epsilon":
+                    target = noise
+                elif train_noise_scheduler.prediction_type == "v_prediction":
+                    target = train_noise_scheduler.get_velocity(
+                        latents, noise, timesteps
                     )
-
-                    num_frames = teacher_pred_cond.shape[1]
-                    print("num_frames of teacher_pred_cond", num_frames)
-                    guidance_scale = torch.linspace(np.random.choice([1, 1.25, 1.5]), np.random.choice([2, 2.25, 2.5]), cfg.num_frames).unsqueeze(0)
-                    guidance_scale = guidance_scale.to(accelerator.device, weight_dtype)
-                    guidance_scale = append_dims(guidance_scale, teacher_pred_cond.ndim)
-                    teacher_output = teacher_pred_uncond + guidance_scale * (teacher_pred_cond - teacher_pred_uncond)
-
-                    indices_next, sigmas_next, timesteps_next, weights_next, c_in_next, c_out_next, c_skip_next = svd_solver.sample_params(indices_next)
-                    noisy_latents_next = svd_solver.euler_solver(teacher_output, noisy_latents,indices, indices_next)
-
-                    inp_noisy_latents_next_scale = noisy_latents_next * c_in_next
-                    inp_noisy_latents_next = torch.cat(
-                    [inp_noisy_latents_next_scale, conditional_latents], dim=2)
-
-                    model_pred_next = target_net(inp_noisy_latents_next, timesteps_next, ref_image_latents, face_emb, face_mask_img, uncond_fwd)
-
-                    print("model_pred_next ", model_pred_next.shape)
-                    print("c_out_next ", c_out_next.shape)
-
-                    print("noisy_latents_next ", noisy_latents_next.shape)
-                    print("c_skip_next ", c_skip_next.shape)
-                    denoised_latents_next = model_pred_next * c_out_next + noisy_latents_next * c_skip_next
-
-                # # Sample a random timestep for each video
-                # timesteps = torch.randint(
-                #     0,
-                #     train_noise_scheduler.num_train_timesteps,
-                #     (bsz,),
-                #     device=latents.device,
-                # )
-                # timesteps = timesteps.long()
-
-                # # add noise
-                # noisy_latents = train_noise_scheduler.add_noise(
-                #     latents, noise, timesteps
-                # )
-
-                # # Get the target for loss depending on the prediction type
-                # if train_noise_scheduler.prediction_type == "epsilon":
-                #     target = noise
-                # elif train_noise_scheduler.prediction_type == "v_prediction":
-                #     target = train_noise_scheduler.get_velocity(
-                #         latents, noise, timesteps
-                #     )
-                # else:
-                #     raise ValueError(
-                #         f"Unknown prediction type {train_noise_scheduler.prediction_type}"
-                #     )
-
-                target = denoised_latents_next
-
-                model_pred = net(
-                    inp_noisy_latents,
+                else:
+                    raise ValueError(
+                        f"Unknown prediction type {train_noise_scheduler.prediction_type}"
+                    )
+                noise_pred = net(
+                    noisy_latents,
                     timesteps,
                     ref_image_latents,
-                    face_emb,
+                    face_emb_cond,
                     face_mask_img,
-                    uncond_fwd,
+                    timestep_cond=w_embedding,
                 )
 
-                # Denoise the latents
-                denoised_latents = model_pred * c_out + c_skip * noisy_latents
-
-                # if cfg.snr_gamma == 0:
-                #     loss = F.mse_loss(
-                #         model_pred.float(), target.float(), reduction="mean"
-                #     )
-                # else:
-                #     snr = compute_snr(train_noise_scheduler, timesteps)
-                #     if train_noise_scheduler.config.prediction_type == "v_prediction":
-                #         # Velocity objective requires that we add one to SNR values before we divide by them.
-                #         snr = snr + 1
-                #     mse_loss_weights = (
-                #         torch.stack(
-                #             [snr, cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
-                #         ).min(dim=1)[0]
-                #         / snr
-                #     )
-                #     loss = F.mse_loss(
-                #         model_pred.float(), target.float(), reduction="none"
-                #     )
-                #     loss = (
-                #         loss.mean(dim=list(range(1, len(loss.shape))))
-                #         * mse_loss_weights
-                #     )
-                #     loss = loss.mean()
-
-                # # Gather the losses across all processes for logging (if we use distributed training).
-                # avg_loss = accelerator.gather(
-                #     loss.repeat(cfg.data.train_bs)).mean()
-                # train_loss += avg_loss.item() / cfg.solver.gradient_accumulation_steps
-
-                loss =  torch.mean(
-                 weights.float() * (torch.sqrt((denoised_latents.float()- target.float()) ** 2 + 0.001**2) - 0.001)
+                pred_x_0 = predicted_origin(
+                    noise_pred,
+                    start_timesteps,
+                    noisy_latents,
+                    train_noise_scheduler.config.prediction_type,
+                    alpha_schedule,
+                    sigma_schedule,
                 )
-                loss = loss.mean()
+
+                model_pred = c_skip_start * noisy_latents + c_out_start * pred_x_0
+
+                # 20.4.10. Use the ODE solver to predict the kth step in the augmented PF-ODE trajectory after
+                # noisy_latents with both the conditioning embedding c and unconditional embedding 0
+                # Get teacher model prediction on noisy_latents and conditional embedding
+                with torch.no_grad():
+                    cond_teacher_output = teacher_net(
+                        noisy_latents,
+                        timesteps,
+                        ref_image_latents,
+                        face_emb_cond,
+                        face_mask_img,
+                    )
+                    cond_pred_x0 = predicted_origin(
+                        cond_teacher_output,
+                        start_timesteps,
+                        noisy_latents,
+                        train_noise_scheduler.config.prediction_type,
+                        alpha_schedule,
+                        sigma_schedule,
+                    )
+
+                    uncond_teacher_output = teacher_net(
+                        noisy_latents,
+                        timesteps,
+                        ref_image_latents,
+                        face_emb_uncond,
+                        face_mask_img,
+                        True,
+                    )
+
+                    uncond_pred_x0 = predicted_origin(
+                        uncond_teacher_output,
+                        start_timesteps,
+                        noisy_latents,
+                        train_noise_scheduler.config.prediction_type,
+                        alpha_schedule,
+                        sigma_schedule,
+                    )
+
+                    # 20.4.11. Perform "CFG" to get x_prev estimate (using the LCM paper's CFG formulation)
+                    pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
+                    pred_noise = cond_teacher_output + w * (cond_teacher_output - uncond_teacher_output)
+                    x_prev = solver.ddim_step(pred_x0, pred_noise, index)
+
+                # 20.4.12. Get target LCM prediction on x_prev, w, c, t_n
+                with torch.no_grad():
+                    target_noise_pred = target_net(
+                        x_prev.float(),
+                        timesteps,
+                        ref_image_latents,
+                        face_emb_cond,
+                        face_mask_img,
+                        timestep_cond=w_embedding,
+                    )
+                    pred_x_0 = predicted_origin(
+                        target_noise_pred,
+                        timesteps,
+                        x_prev,
+                        train_noise_scheduler.config.prediction_type,
+                        alpha_schedule,
+                        sigma_schedule,
+                    )
+                    target = c_skip * x_prev + c_out * pred_x_0
+
+                # 20.4.13. Calculate loss
+                if cfg.loss.loss_type == "l2":
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                elif cfg.loss.loss_type == "huber":
+                    loss = torch.mean(
+                        torch.sqrt((model_pred.float() - target.float()) ** 2 + cfg.loss.huber_c**2) - cfg.loss.huber_c
+                    )
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(
-                    loss.repeat(cfg.per_gpu_batch_size)).mean()
+                    loss.repeat(cfg.data.train_bs)).mean()
                 train_loss += avg_loss.item() / cfg.solver.gradient_accumulation_steps
 
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    # accelerator.clip_grad_norm_(
-                    #     trainable_params,
-                    #     cfg.solver.max_grad_norm,
-                    # )
-                    update_ema(target_net.parameters(), net.parameters(), cfg.target_ema_decay)
+                    accelerator.clip_grad_norm_(
+                        trainable_params,
+                        cfg.solver.max_grad_norm,
+                    )
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
             if accelerator.sync_gradients:
+                update_ema(target_net.parameters(), net.parameters(), cfg.ema_decay)
+
+                teacher_net.reference_control_reader.clear()
+                teacher_net.reference_control_writer.clear()
+                target_net.reference_control_reader.clear()
+                target_net.reference_control_writer.clear()
                 reference_control_reader.clear()
                 reference_control_writer.clear()
                 progress_bar.update(1)
@@ -980,7 +954,22 @@ def train_stage1_process(cfg: argparse.Namespace) -> None:
                             cfg=cfg,
                             save_dir=validation_dir,
                             global_step=global_step,
-                            face_analysis_model_path=cfg.face_analysis_model_path
+                            face_analysis_model_path=cfg.face_analysis_model_path,
+                            name="online",
+                        )
+                        log_validation(
+                            vae=vae,
+                            net=target_net,
+                            scheduler=val_noise_scheduler,
+                            accelerator=accelerator,
+                            width=cfg.data.train_width,
+                            height=cfg.data.train_height,
+                            imageproj=imageproj,
+                            cfg=cfg,
+                            save_dir=validation_dir,
+                            global_step=global_step,
+                            face_analysis_model_path=cfg.face_analysis_model_path,
+                            name="target",
                         )
 
             logs = {
@@ -1023,7 +1012,7 @@ def load_config(config_path: str) -> dict:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str,
-                        default="./configs/train/stage1_lcm.yaml")
+                        default="./configs/train/stage1.yaml")
     args = parser.parse_args()
 
     try:
@@ -1031,4 +1020,3 @@ if __name__ == "__main__":
         train_stage1_process(config)
     except Exception as e:
         logging.error("Failed to execute the training process: %s", e)
-        logging.error(traceback.format_exc())

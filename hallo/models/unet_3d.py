@@ -523,6 +523,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
         mid_block_additional_residual: Optional[torch.Tensor] = None,
         return_dict: bool = True,
+        timestep_cond: Optional[torch.Tensor] = None,
         # start: bool = False,
     ) -> Union[UNet3DConditionOutput, Tuple]:
         r"""
@@ -703,6 +704,9 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     # audio_embedding=audio_embedding,
                 )
+
+        if timestep_cond is not None:
+            sample = torch.cat([sample, timestep_cond], dim=1)
 
         # post-process
         sample = self.conv_norm_out(sample)

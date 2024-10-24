@@ -2,6 +2,7 @@ N: 40
 per_gpu_batch_size: 1
 target_ema_decay: 0.95
 num_frames: 4
+# unet_time_cond_proj_dim: 512
 data:
   train_bs: 8
   train_width: 512
@@ -11,7 +12,12 @@ data:
   # Margin of frame indexes between ref and tgt images
   sample_margin: 30
 
+guidance_scale:
+  w_min: 5.0
+  w_max: 15.0
+
 solver:
+  num_ddim_timesteps: 50
   gradient_accumulation_steps: 1
   mixed_precision: "no"
   enable_xformers_memory_efficient_attention: True
