@@ -115,6 +115,7 @@ class Net(nn.Module):
         face_emb,
         face_mask,
         uncond_fwd: bool = False,
+        timestep_cond: torch.Tensor = None,
     ):
         """
         Forward pass of the model.
@@ -149,6 +150,7 @@ class Net(nn.Module):
             timesteps,
             mask_cond_fea=face_mask_feature,
             encoder_hidden_states=face_emb,
+            timestep_cond=timestep_cond,
         ).sample
 
         return model_pred
